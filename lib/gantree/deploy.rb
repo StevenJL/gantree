@@ -1,95 +1,136 @@
-module Gantree
-  class Deploy
+require 'json'
+require 'archive/zip'
+require 'colorize'
+require_relative 'notification'
 
-    def initialize app,options
+module Gantree
+  class Deploy < Base
+    attr_reader :name
+
+    def initialize name, options
+      check_credentials
+      set_aws_keys
+      @name = name
       @options = options
-      AWS.config(
-        :access_key_id => ENV['AWS_ACCESS_KEY_ID'],
-        :secret_access_key => ENV['AWS_SECRET_ACCESS_KEY'])
-      @app = @options[:env] || app.match(/^[a-zA-Z]*\-([a-zA-Z]*)\-[a-zA-Z]*\-([a-zA-Z]*\d*)/)[1] + "-" + app.match(/^([a-zA-Z]*)\-([a-zA-Z]*)\-[a-zA-Z]*\-([a-zA-Z]*\d*)/)[1] + '-' + app.match(/^([a-zA-Z]*)\-([a-zA-Z]*)\-[a-zA-Z]*\-([a-zA-Z]*\d*)/)[3]
-      @env = app
-      @version_label = set_version_label
-      @eb = AWS::ElasticBeanstalk::Client.new
-      @s3 = AWS::S3.new
-      @tag = options.tag
+      @ext = @options[:ext]
+      @dockerrun_file = "Dockerrun.aws.json"
+      print_options
     end
 
     def run
-      puts "Deploying #{@app}"
-      upload_to_s3
-      create_version
-      update_application
+      check_eb_bucket
+      if application?
+        DeployApplication.new(@name,@options).run
+      elsif environment?
+        puts "Found Environment: #{name}".green
+        deploy([name])
+      else
+        error_msg "You leave me with nothing to deploy".red
+      end
     end
 
-    private
+    def environment_found?
+      @environments.length >=1 ? true : false
+    end
+
+    def deploy_to_one
+      env = @environments.first[:environment_name]
+      puts "Found Environment: #{env}".green
+      deploy([env])
+    end
+
+    def application?
+      results = eb.describe_applications({ application_names: ["#{@name}"]})
+      results[:applications].length == 1 ? true : false
+    end
+
+
+    def environment?
+      results = eb.describe_environments({ environment_names: ["#{@name}"]})[:environments]
+      if results.length == 0
+        puts "ERROR: Environment '#{name}' not found"
+        exit 1
+      else
+        @app = results[0][:application_name]
+        return true
+      end
+    end
+
+    def deploy(envs)
+      check_dir_name(envs) unless @options[:force]
+      return if @options[:dry_run]
+      version = DeployVersion.new(@options)
+      @packaged_version = version.run
+      upload_to_s3 
+      version.clean_up 
+      create_eb_version
+      update_application(envs)
+      if @options[:slack]
+        msg = "#{ENV['USER']} is deploying #{@packaged_version} to #{@app} "
+        msg += "Tag: #{@options[:tag]}" if @options[:tag]
+        Notification.new(@options[:slack]).say(msg) unless @options[:silent]
+      end
+    end
 
     def upload_to_s3
-      
-      filename = @version_label
-      FileUtils.cp("Dockerrun.aws.json", filename)
-      set_tag_to_deploy if @tag
-      key = File.basename(filename)
-      begin
-        puts "uploading dockerrun to #{@app}-versions"
-        @s3.buckets["#{@app}-versions"].objects[key].write(:file => filename)
-      rescue AWS::S3::Errors::NoSuchBucket
-        puts "bucket didn't exist...creating"
-        bucket = @s3.buckets.create("#{@app}-versions")
-        retry
-      rescue AWS::S3::Errors::AccessDenied
-        puts "Your key is not configured for s3 access, please let your operations team know"
-        FileUtils.rm(filename)
-        exit
-      end
-      FileUtils.rm(filename)
+      puts "uploading #{@packaged_version} to #{set_bucket}"
+      s3.buckets["#{set_bucket}"].objects["#{@app}-#{@packaged_version}"].write(:file => @packaged_version)
     end
 
-    def create_version
+    def create_eb_version
       begin
-        @eb.create_application_version({
-          :application_name => @app,
-          :version_label => @version_label,
+        eb.create_application_version({
+          :application_name => "#{@app}",
+          :version_label => "#{@packaged_version}",
           :source_bundle => {
-            :s3_bucket => "#{@app}-versions",
-            :s3_key => @version_label
+            :s3_bucket => "#{set_bucket}",
+            :s3_key => "#{@app}-#{@packaged_version}"
           }
         })
-      rescue AWS::ElasticBeanstalk::Errors::InvalidParameterValue
-        puts "Version already exists, recreating..."
-        begin 
-          @eb.delete_application_version({
-            :application_name => @app,
-            :version_label => @version_label,
-            :delete_source_bundle => false
+      rescue AWS::ElasticBeanstalk::Errors::InvalidParameterValue => e
+        puts "No Application named #{@app} found #{e}"
+      end
+    end
+
+    def update_application(envs)
+      envs.each do |env|
+        begin
+          eb.update_environment({
+            :environment_name => env,
+            :version_label => @packaged_version
           })
-          retry
-        rescue AWS::ElasticBeanstalk::Errors::InvalidParameterValue
-          puts "No Application named #{@app} found"
+          puts "Deployed #{@packaged_version} to #{env} on #{@app}".green
+        rescue AWS::ElasticBeanstalk::Errors::InvalidParameterValue => e
+          puts "Error: Something went wrong during the deploy to #{env}".red
+          puts "#{e.message}"
         end
       end
     end
 
-    def update_application
-      begin
-        @eb.update_environment({
-          :environment_name => @env,
-          :version_label => @version_label
-        })
-      rescue AWS::ElasticBeanstalk::Errors::InvalidParameterValue
-        puts "#{@env} doesn't exist"
+    def check_dir_name envs
+      dir_name = File.basename(Dir.getwd)
+      msg = "WARN: You are deploying from a repo that doesn't match #{@app}"
+      puts msg.yellow if envs.any? { |env| env.include?(dir_name) } == false
+    end
+
+    def check_eb_bucket
+      bucket = set_bucket
+      s3.buckets.create(bucket) unless s3.buckets[bucket].exists?
+    end
+
+    def set_bucket
+      if @options[:eb_bucket]
+        bucket = @options[:eb_bucket]
+      else
+        bucket = generate_eb_bucket
       end
     end
-
-    def set_version_label
-      branch = `git rev-parse --abbrev-ref HEAD`
-      hash = `git rev-parse --verify --short #{branch}`.strip
-      "#{@env}-#{hash}-Dockerrun.aws.json"
+    
+    def generate_eb_bucket 
+      unique_hash = Digest::SHA1.hexdigest ENV['AWS_ACCESS_KEY_ID']
+      "eb-bucket-#{unique_hash}"
     end
 
-    def set_tag_to_deploy
-      docker =JSON.parse(IO.read("Dockerrun.aws.json"))
-      docker["Image"]["Name"].gsub!(/:(.*)$/, ":#{@tag}")
-      IO.write(@version_label,JSON.pretty_generate(docker))
-    end
   end
 end
+

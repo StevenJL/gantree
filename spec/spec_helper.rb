@@ -11,6 +11,7 @@ require "codeclimate-test-reporter"
 CodeClimate::TestReporter.start
 
 require "pp"
+require "vcr"
  
 root = File.expand_path('../../', __FILE__)
 require "#{root}/lib/gantree"
@@ -19,6 +20,7 @@ module Helpers
   def execute(cmd)
     puts "Running: #{cmd}" if ENV['DEBUG']
     out = `#{cmd}`
+    raise "Stack Trance Found: \n #{out}" if out.include? "Error"
     puts out if ENV['DEBUG']
     out
   end
@@ -39,8 +41,31 @@ RSpec.configure do |c|
   #    example.run
   #  end if ENV['VCR'] == '1'
   #end
+  c.after(:all) do
+    FileUtils.rm_rf("Dockerrun.aws.json")
+    FileUtils.rm_rf("*.zip")
+  end
+end
+#
+#VCR.configure do |config|
+#  config.cassette_library_dir = "spec/fixtures/vcr"  
+#  config.hook_into :fakeweb
+#  config.default_cassette_options = {:record => :once}
+#  config.ignore_hosts "codeclimate.com"
+#end
+#
+#
+
+class Existence
+  def self.exists?
+    true
+  end
 end
 
-#VCR.configure do |config|
-#  config.ignore_hosts 'codeclimate.com'
-#end if ENV['VCR'] == '1'
+class NonExistence
+  def self.exists?
+    false
+  end
+end
+
+

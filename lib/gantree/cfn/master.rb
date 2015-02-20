@@ -2,6 +2,8 @@ class MasterTemplate
 
   def initialize params
     @stack_name = params[:stack_name]
+    @rds = params[:rds]
+    @rds_enabled = params[:rds?]
     @env = params[:env]
     @bucket = params[:cfn_bucket]
     @requirements = params[:requirements]
@@ -16,47 +18,43 @@ class MasterTemplate
       parameter 'ResourcesTemplate',
                 :Description => 'The key of the template for the resources required to run the app',
                 :Type => 'String',
-                :Default => '#{@env}-resources.cfn.json'
+                :Default => '#{@stack_name}-resources.cfn.json'
 
       parameter 'AppTemplate',
                 :Description => 'The key of the template for the EB app/env substack',
                 :Type => 'String',
-                :Default => '#{@env}-beanstalk.cfn.json'
+                :Default => '#{@stack_name}-beanstalk.cfn.json'
 
       parameter 'KeyName',
                 :Type => 'String',
                 :Default => 'default'
 
-      parameter 'InstanceType',
-                :Type => 'String',
-                :Default => 't1.micro'
-
       parameter 'ApplicationName',
                 :Type => 'String',
-                :Default => '#{@env}'
+                :Default => '#{@stack_name}'
 
       parameter 'Environment',
                 :Type => 'String',
-                :Default => '#{env_type}'
+                :Default => '#{@env_type}'
 
       parameter 'IamInstanceProfile',
                 :Type => 'String',
                 :Default => 'EbApp'
 
       resource 'AppResources', :Type => 'AWS::CloudFormation::Stack', :Properties => {
-          :TemplateURL => join('/', 'http://s3.amazonaws.com', '#{@bucket}', '#{@env}', ref('ResourcesTemplate')),
+          :TemplateURL => join('/', 'http://s3.amazonaws.com', '#{@bucket}', '#{@stack_name}', ref('ResourcesTemplate')),
           :Parameters => { :ApplicationName => ref('ApplicationName') },
       }
 
       resource 'App', :Type => 'AWS::CloudFormation::Stack', :Properties => {
-          :TemplateURL => join('/', 'http://s3.amazonaws.com','#{@bucket}', '#{@env}', ref('AppTemplate')),
+          :TemplateURL => join('/', 'http://s3.amazonaws.com','#{@bucket}', '#{@stack_name}', ref('AppTemplate')),
           :Parameters => {
               :KeyName => ref('KeyName'),
               :InstanceSecurityGroup => get_att('AppResources', 'Outputs.InstanceSecurityGroup'),
-              :InstanceType => ref('InstanceType'),
               :ApplicationName => ref('ApplicationName'),
               :Environment => ref('Environment'),
               :IamInstanceProfile => ref('IamInstanceProfile'),
+              #{":RDSHostURLPass => get_att('AppResources','Outputs.RDSHostURL')," if @rds_enabled}
           },
       }
 
@@ -65,15 +63,5 @@ class MasterTemplate
              :Value => get_att('App', 'Outputs.URL')
 
     end.exec!"
-  end
-
-  def env_type
-    if @env.include?("prod")
-      "prod"
-    elsif @env.include?("stag")
-      "stag"
-    else
-      ""
-    end
   end
 end
